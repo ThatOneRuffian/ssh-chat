@@ -198,6 +198,19 @@ func (u *User) SetHighlight(s string) error {
 
 func (u *User) render(m Message) string {
 	cfg := u.Config()
+	if cfg.Timezone == nil{
+		defaultTimeFormat := "15:04"
+		tempTimezone, err := time.LoadLocation("America/Los_Angeles")
+		if err != nil{
+			fmt.Println(err)
+			tempTimezone = nil
+		}
+		if cfg.Timeformat == nil{
+			cfg.Timeformat = &defaultTimeFormat
+		}
+
+		cfg.Timezone = tempTimezone
+	}
 	var out string
 	switch m := m.(type) {
 	case PublicMsg:

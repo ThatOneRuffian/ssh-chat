@@ -179,7 +179,7 @@ func (h *Host) Connect(term *sshd.Terminal) {
 	if h.isOp(term.Conn) {
 		member.IsOp = true
 	}
-	ratelimit := rateio.NewSimpleLimiter(3, time.Second*3)
+	ratelimit := rateio.NewSimpleLimiter(90, time.Second*3)
 
 	logger.Debugf("[%s] Joined: %s", term.Conn.RemoteAddr(), user.Name())
 

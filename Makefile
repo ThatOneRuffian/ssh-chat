@@ -11,6 +11,9 @@ all: $(BINARY)
 $(BINARY): **/**/*.go **/*.go *.go
 	go build -ldflags "$(LDFLAGS)" ./cmd/ssh-chat
 
+arm:
+	env GOOS=linux GOARCH=arm GOARM=5 go build -ldflags "$(LDFLAGS)" ./cmd/ssh-chat
+
 build: $(BINARY)
 
 clean:

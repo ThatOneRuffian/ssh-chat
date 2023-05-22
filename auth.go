@@ -1,11 +1,14 @@
 package sshchat
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/csv"
 	"errors"
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/shazow/ssh-chat/set"
@@ -13,12 +16,19 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// ErrNotWhitelisted Is the error returned when a key is checked that is not whitelisted,
-// when whitelisting is enabled.
-var ErrNotWhitelisted = errors.New("not whitelisted")
+// KeyLoader loads public keys, e.g. from an authorized_keys file.
+// It must return a nil slice on error.
+type KeyLoader func() ([]ssh.PublicKey, error)
 
-// ErrBanned is the error returned when a key is checked that is banned.
+// ErrNotAllowed Is the error returned when a key is checked that is not allowlisted,
+// when allowlisting is enabled.
+var ErrNotAllowed = errors.New("not allowed")
+
+// ErrBanned is the error returned when a client is banned.
 var ErrBanned = errors.New("banned")
+
+// ErrIncorrectPassphrase is the error returned when a provided passphrase is incorrect.
+var ErrIncorrectPassphrase = errors.New("incorrect passphrase")
 
 // newAuthKey returns string from an ssh.PublicKey used to index the key in our lookup.
 func newAuthKey(key ssh.PublicKey) string {
@@ -42,13 +52,20 @@ func newAuthAddr(addr net.Addr) string {
 	return host
 }
 
-// Auth stores lookups for bans, whitelists, and ops. It implements the sshd.Auth interface.
+// Auth stores lookups for bans, allowlists, and ops. It implements the sshd.Auth interface.
+// If the contained passphrase is not empty, it complements a allowlist.
 type Auth struct {
-	bannedAddr   *set.Set
-	bannedClient *set.Set
-	banned       *set.Set
-	whitelist    *set.Set
-	ops          *set.Set
+	passphraseHash []byte
+	bannedAddr     *set.Set
+	bannedClient   *set.Set
+	banned         *set.Set
+	allowlist      *set.Set
+	ops            *set.Set
+
+	settingsMu      sync.RWMutex
+	allowlistMode   bool
+	opLoader        KeyLoader
+	allowlistLoader KeyLoader
 }
 
 // NewAuth creates a new empty Auth.
@@ -57,28 +74,47 @@ func NewAuth() *Auth {
 		bannedAddr:   set.New(),
 		bannedClient: set.New(),
 		banned:       set.New(),
-		whitelist:    set.New(),
+		allowlist:    set.New(),
 		ops:          set.New(),
+	}
+}
+
+func (a *Auth) AllowlistMode() bool {
+	a.settingsMu.RLock()
+	defer a.settingsMu.RUnlock()
+	return a.allowlistMode
+}
+
+func (a *Auth) SetAllowlistMode(value bool) {
+	a.settingsMu.Lock()
+	defer a.settingsMu.Unlock()
+	a.allowlistMode = value
+}
+
+// SetPassphrase enables passphrase authentication with the given passphrase.
+// If an empty passphrase is given, disable passphrase authentication.
+func (a *Auth) SetPassphrase(passphrase string) {
+	if passphrase == "" {
+		a.passphraseHash = nil
+	} else {
+		hashArray := sha256.Sum256([]byte(passphrase))
+		a.passphraseHash = hashArray[:]
 	}
 }
 
 // AllowAnonymous determines if anonymous users are permitted.
 func (a *Auth) AllowAnonymous() bool {
-	return a.whitelist.Len() == 0
+	return !a.AllowlistMode() && a.passphraseHash == nil
 }
 
-// Check determines if a pubkey fingerprint is permitted.
-func (a *Auth) Check(addr net.Addr, key ssh.PublicKey, clientVersion string) error {
-	authkey := newAuthKey(key)
+// AcceptPassphrase determines if passphrase authentication is accepted.
+func (a *Auth) AcceptPassphrase() bool {
+	return a.passphraseHash != nil
+}
 
-	if a.whitelist.Len() != 0 {
-		// Only check whitelist if there is something in it, otherwise it's disabled.
-		whitelisted := a.whitelist.In(authkey)
-		if !whitelisted {
-			return ErrNotWhitelisted
-		}
-		return nil
-	}
+// CheckBans checks IP, key and client bans.
+func (a *Auth) CheckBans(addr net.Addr, key ssh.PublicKey, clientVersion string) error {
+	authkey := newAuthKey(key)
 
 	var banned bool
 	if authkey != "" {
@@ -98,6 +134,29 @@ func (a *Auth) Check(addr net.Addr, key ssh.PublicKey, clientVersion string) err
 	return nil
 }
 
+// CheckPubkey determines if a pubkey fingerprint is permitted.
+func (a *Auth) CheckPublicKey(key ssh.PublicKey) error {
+	authkey := newAuthKey(key)
+	allowlisted := a.allowlist.In(authkey)
+	if a.AllowAnonymous() || allowlisted || a.IsOp(key) {
+		return nil
+	} else {
+		return ErrNotAllowed
+	}
+}
+
+// CheckPassphrase determines if a passphrase is permitted.
+func (a *Auth) CheckPassphrase(passphrase string) error {
+	if !a.AcceptPassphrase() {
+		return errors.New("passphrases not accepted") // this should never happen
+	}
+	passedPassphraseHash := sha256.Sum256([]byte(passphrase))
+	if subtle.ConstantTimeCompare(passedPassphraseHash[:], a.passphraseHash) == 0 {
+		return ErrIncorrectPassphrase
+	}
+	return nil
+}
+
 // Op sets a public key as a known operator.
 func (a *Auth) Op(key ssh.PublicKey, d time.Duration) {
 	if key == nil {
@@ -114,25 +173,68 @@ func (a *Auth) Op(key ssh.PublicKey, d time.Duration) {
 
 // IsOp checks if a public key is an op.
 func (a *Auth) IsOp(key ssh.PublicKey) bool {
-	if key == nil {
-		return false
-	}
 	authkey := newAuthKey(key)
 	return a.ops.In(authkey)
 }
 
-// Whitelist will set a public key as a whitelisted user.
-func (a *Auth) Whitelist(key ssh.PublicKey, d time.Duration) {
+// LoadOps sets the public keys form loader to operators and saves the loader for later use
+func (a *Auth) LoadOps(loader KeyLoader) error {
+	a.settingsMu.Lock()
+	a.opLoader = loader
+	a.settingsMu.Unlock()
+	return a.ReloadOps()
+}
+
+// ReloadOps sets the public keys from a loader saved in the last call to operators
+func (a *Auth) ReloadOps() error {
+	a.settingsMu.RLock()
+	defer a.settingsMu.RUnlock()
+	return addFromLoader(a.opLoader, a.Op)
+}
+
+// Allowlist will set a public key as a allowlisted user.
+func (a *Auth) Allowlist(key ssh.PublicKey, d time.Duration) {
 	if key == nil {
 		return
 	}
+	var err error
 	authItem := newAuthItem(key)
 	if d != 0 {
-		a.whitelist.Set(set.Expire(authItem, d))
+		err = a.allowlist.Set(set.Expire(authItem, d))
 	} else {
-		a.whitelist.Set(authItem)
+		err = a.allowlist.Set(authItem)
 	}
-	logger.Debugf("Added to whitelist: %q (for %s)", authItem.Key(), d)
+	if err == nil {
+		logger.Debugf("Added to allowlist: %q (for %s)", authItem.Key(), d)
+	} else {
+		logger.Errorf("Error adding %q to allowlist for %s: %s", authItem.Key(), d, err)
+	}
+}
+
+// LoadAllowlist adds the public keys from the loader to the allowlist and saves the loader for later use
+func (a *Auth) LoadAllowlist(loader KeyLoader) error {
+	a.settingsMu.Lock()
+	a.allowlistLoader = loader
+	a.settingsMu.Unlock()
+	return a.ReloadAllowlist()
+}
+
+//  LoadAllowlist adds the public keys from a loader saved in a previous call to the allowlist
+func (a *Auth) ReloadAllowlist() error {
+	a.settingsMu.RLock()
+	defer a.settingsMu.RUnlock()
+	return addFromLoader(a.allowlistLoader, a.Allowlist)
+}
+
+func addFromLoader(loader KeyLoader, adder func(ssh.PublicKey, time.Duration)) error {
+	if loader == nil {
+		return nil
+	}
+	keys, err := loader()
+	for _, key := range keys {
+		adder(key, 0)
+	}
+	return err
 }
 
 // Ban will set a public key as banned.

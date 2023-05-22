@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"net/http"
@@ -10,7 +9,6 @@ import (
 	"os/signal"
 	"os/user"
 	"strings"
-	"time"
 
 	"github.com/alexcesaro/log"
 	"github.com/alexcesaro/log/golog"
@@ -30,16 +28,17 @@ var Version string = "dev"
 
 // Options contains the flag options
 type Options struct {
-	Admin      string `long:"admin" description:"File of public keys who are admins."`
-	Bind       string `long:"bind" description:"Host and port to listen on." default:"0.0.0.0:2022"`
-	Identity   string `short:"i" long:"identity" description:"Private key to identify server with." default:"~/.ssh/id_rsa"`
-	Log        string `long:"log" description:"Write chat log to this file."`
-	Motd       string `long:"motd" description:"Optional Message of the Day file."`
-	Pprof      int    `long:"pprof" description:"Enable pprof http server for profiling."`
-	Verbose    []bool `short:"v" long:"verbose" description:"Show verbose logging."`
-	Version    bool   `long:"version" description:"Print version and exit."`
-	Whitelist  string `long:"whitelist" description:"Optional file of public keys who are allowed to connect."`
-	Passphrase string `long:"unsafe-passphrase" description:"Require an interactive passphrase to connect. Whitelist feature is more secure."`
+	Admin      string   `long:"admin" description:"File of public keys who are admins."`
+	Bind       string   `long:"bind" description:"Host and port to listen on." default:"0.0.0.0:2022"`
+	Identity   []string `short:"i" long:"identity" description:"Private key to identify server with." default:"~/.ssh/id_rsa"`
+	Log        string   `long:"log" description:"Write chat log to this file."`
+	Motd       string   `long:"motd" description:"Optional Message of the Day file."`
+	Pprof      int      `long:"pprof" description:"Enable pprof http server for profiling."`
+	Verbose    []bool   `short:"v" long:"verbose" description:"Show verbose logging."`
+	Version    bool     `long:"version" description:"Print version and exit."`
+	Allowlist  string   `long:"allowlist" description:"Optional file of public keys who are allowed to connect."`
+	Whitelist  string   `long:"whitelist" dexcription:"Old name for allowlist option"`
+	Passphrase string   `long:"unsafe-passphrase" description:"Require an interactive passphrase to connect. Allowlist feature is more secure."`
 }
 
 const extraHelp = `There are hidden options and easter eggs in ssh-chat. The source code is a good
@@ -89,7 +88,7 @@ func main() {
 
 	// Figure out the log level
 	numVerbose := len(options.Verbose)
-	if numVerbose > len(logLevels) {
+	if numVerbose >= len(logLevels) {
 		numVerbose = len(logLevels) - 1
 	}
 
@@ -104,61 +103,26 @@ func main() {
 		message.SetLogger(os.Stderr)
 	}
 
-	privateKeyPath := options.Identity
-	if strings.HasPrefix(privateKeyPath, "~/") {
-		user, err := user.Current()
-		if err == nil {
-			privateKeyPath = strings.Replace(privateKeyPath, "~", user.HomeDir, 1)
-		}
-	}
-
-	signer, err := ReadPrivateKey(privateKeyPath)
-	if err != nil {
-		fail(3, "Failed to read identity private key: %v\n", err)
-	}
-
 	auth := sshchat.NewAuth()
 	config := sshd.MakeAuth(auth)
-	config.AddHostKey(signer)
 	config.ServerVersion = "SSH-2.0-Go ssh-chat"
 	// FIXME: Should we be using config.NoClientAuth = true by default?
 
-	if options.Passphrase != "" {
-		if options.Whitelist != "" {
-			logger.Warning("Passphrase is disabled while whitelist is enabled.")
-		}
-		if config.KeyboardInteractiveCallback != nil {
-			fail(1, "Passphrase authentication conflicts with existing KeyboardInteractive setup.") // This should not happen
-		}
-
-		// We use KeyboardInteractiveCallback instead of PasswordCallback to
-		// avoid preventing the client from including a pubkey in the user
-		// identification.
-		config.KeyboardInteractiveCallback = func(conn ssh.ConnMetadata, challenge ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
-			answers, err := challenge("", "", []string{"Passphrase required to connect: "}, []bool{true})
-			if err != nil {
-				return nil, err
-			}
-			if len(answers) == 1 && answers[0] == options.Passphrase {
-				// Success
-				return nil, nil
-			}
-			// It's not gonna do much but may as well throttle brute force attempts a little
-			time.Sleep(2 * time.Second)
-
-			return nil, errors.New("incorrect passphrase")
-		}
-
-		// We also need to override the PublicKeyCallback to prevent rando pubkeys from bypassing
-		cb := config.PublicKeyCallback
-		config.PublicKeyCallback = func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-			perms, err := cb(conn, key)
+	for _, privateKeyPath := range options.Identity {
+		if strings.HasPrefix(privateKeyPath, "~/") {
+			user, err := user.Current()
 			if err == nil {
-				err = errors.New("passphrase authentication required")
+				privateKeyPath = strings.Replace(privateKeyPath, "~", user.HomeDir, 1)
 			}
-			return perms, err
 		}
 
+		signer, err := ReadPrivateKey(privateKeyPath)
+		if err != nil {
+			fail(3, "Failed to read identity private key: %v\n", err)
+		}
+
+		config.AddHostKey(signer)
+		fmt.Printf("Added server identity: %s\n", sshd.Fingerprint(signer.PublicKey()))
 	}
 
 	s, err := sshd.ListenSSH(options.Bind, config)
@@ -174,35 +138,24 @@ func main() {
 	host.SetTheme(message.Themes[0])
 	host.Version = Version
 
-	err = fromFile(options.Admin, func(line []byte) error {
-		key, _, _, _, err := ssh.ParseAuthorizedKey(line)
-		if err != nil {
-			if err.Error() == "ssh: no key found" {
-				return nil // Skip line
-			}
-			return err
-		}
-		auth.Op(key, 0)
-		return nil
-	})
+	if options.Passphrase != "" {
+		auth.SetPassphrase(options.Passphrase)
+	}
+
+	err = auth.LoadOps(loaderFromFile(options.Admin, logger))
 	if err != nil {
 		fail(5, "Failed to load admins: %v\n", err)
 	}
 
-	err = fromFile(options.Whitelist, func(line []byte) error {
-		key, _, _, _, err := ssh.ParseAuthorizedKey(line)
-		if err != nil {
-			if err.Error() == "ssh: no key found" {
-				return nil // Skip line
-			}
-			return err
-		}
-		auth.Whitelist(key, 0)
-		return nil
-	})
-	if err != nil {
-		fail(6, "Failed to load whitelist: %v\n", err)
+	if options.Allowlist == "" && options.Whitelist != "" {
+		fmt.Println("--whitelist was renamed to --allowlist.")
+		options.Allowlist = options.Whitelist
 	}
+	err = auth.LoadAllowlist(loaderFromFile(options.Allowlist, logger))
+	if err != nil {
+		fail(6, "Failed to load allowlist: %v\n", err)
+	}
+	auth.SetAllowlistMode(options.Allowlist != "")
 
 	if options.Motd != "" {
 		host.GetMOTD = func() (string, error) {
@@ -243,24 +196,32 @@ func main() {
 	fmt.Fprintln(os.Stderr, "Interrupt signal detected, shutting down.")
 }
 
-func fromFile(path string, handler func(line []byte) error) error {
+func loaderFromFile(path string, logger *golog.Logger) sshchat.KeyLoader {
 	if path == "" {
-		// Skip
 		return nil
 	}
-
-	file, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		err := handler(scanner.Bytes())
+	return func() ([]ssh.PublicKey, error) {
+		file, err := os.Open(path)
 		if err != nil {
-			return err
+			return nil, err
 		}
+		defer file.Close()
+
+		var keys []ssh.PublicKey
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			key, _, _, _, err := ssh.ParseAuthorizedKey(scanner.Bytes())
+			if err != nil {
+				if err.Error() == "ssh: no key found" {
+					continue // Skip line
+				}
+				return nil, err
+			}
+			keys = append(keys, key)
+		}
+		if keys == nil {
+			logger.Warning("file", path, "contained no keys")
+		}
+		return keys, nil
 	}
-	return nil
 }
